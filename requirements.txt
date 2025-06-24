@@ -1,5 +1,4 @@
-fastapi 
-psycopg 
-python-dotenv 
-uvicorn 
-requests
+fastapi
+uvicorn
+psycopg[binary]
+python-dotenv
