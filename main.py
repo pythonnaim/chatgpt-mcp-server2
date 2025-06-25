@@ -22,7 +22,7 @@ load_dotenv()  # Load DB creds from .env
 app = FastAPI(
     title="Multi-Database MCP Server",
     description="Advanced multi-database connection and query service",
-    version="3.0.0"
+    version="3.0.1"
 )
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,7 +65,6 @@ def load_database_configs():
                 "timeout": int(os.getenv(f"POSTGRES_TIMEOUT_{db_name.upper()}", default_timeout)),
                 "description": db_name
             }
-
     
     return configs
 
@@ -114,7 +113,10 @@ class SimpleConnectionPool:
                 return conn
             except Exception:
                 # Connection is dead, create a new one
-                conn.close()
+                try:
+                    conn.close()
+                except:
+                    pass
                 self.total_connections -= 1
         except Empty:
             pass
@@ -141,7 +143,10 @@ class SimpleConnectionPool:
             raise Exception("Connection pool timeout")
         except Exception:
             # Connection is dead, try one more time
-            conn.close()
+            try:
+                conn.close()
+            except:
+                pass
             self.total_connections -= 1
             raise Exception("Failed to get valid connection from pool")
     
@@ -411,6 +416,7 @@ async def mcp_handler(req: Request):
         elif method == "get_table_names":
             database = params.get("database", "primary")
             schema_filter = params.get("schema", None)
+            table_type_filter = params.get("table_type", None)  # BASE TABLE, VIEW, etc.
             
             # Test connection first
             connected, message, _ = test_database_connection(database)
@@ -433,12 +439,21 @@ async def mcp_handler(req: Request):
                 WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
                 """
                 
+                query_params = []
                 if schema_filter:
-                    table_query += f" AND table_schema = '{schema_filter}'"
+                    table_query += " AND table_schema = %s"
+                    query_params.append(schema_filter)
+                
+                if table_type_filter:
+                    table_query += " AND table_type = %s"
+                    query_params.append(table_type_filter)
                 
                 table_query += " ORDER BY table_schema, table_name"
                 
-                tables = run_query(table_query, database)
+                if query_params:
+                    tables = run_query_with_params(table_query, query_params, database)
+                else:
+                    tables = run_query(table_query, database)
                 
                 return {
                     "jsonrpc": "2.0",
@@ -447,7 +462,8 @@ async def mcp_handler(req: Request):
                         "database": database,
                         "tables": tables,
                         "table_count": len(tables),
-                        "schema_filter": schema_filter
+                        "schema_filter": schema_filter,
+                        "table_type_filter": table_type_filter
                     }
                 }
             except Exception as e:
@@ -457,9 +473,94 @@ async def mcp_handler(req: Request):
                     "id": rpc.id
                 }
 
+        elif method == "get_all_tables":
+            """Get tables from all databases or specific databases"""
+            databases = params.get("databases", list(DATABASE_CONFIGS.keys()))
+            schema_filter = params.get("schema", None)
+            table_type_filter = params.get("table_type", None)
+            
+            if isinstance(databases, str):
+                databases = [databases]
+            
+            results = []
+            
+            for db in databases:
+                if db not in DATABASE_CONFIGS:
+                    results.append({
+                        "database": db,
+                        "error": f"Database '{db}' not configured",
+                        "tables": []
+                    })
+                    continue
+                
+                try:
+                    # Test connection first
+                    connected, conn_message, _ = test_database_connection(db)
+                    if not connected:
+                        results.append({
+                            "database": db,
+                            "error": f"Connection failed: {conn_message}",
+                            "tables": []
+                        })
+                        continue
+                    
+                    # Get tables from this database
+                    table_query = """
+                    SELECT 
+                        table_name, 
+                        table_type, 
+                        table_schema,
+                        (SELECT COUNT(*) FROM information_schema.columns c 
+                         WHERE c.table_name = t.table_name AND c.table_schema = t.table_schema) as column_count
+                    FROM information_schema.tables t
+                    WHERE table_schema NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+                    """
+                    
+                    query_params = []
+                    if schema_filter:
+                        table_query += " AND table_schema = %s"
+                        query_params.append(schema_filter)
+                    
+                    if table_type_filter:
+                        table_query += " AND table_type = %s"
+                        query_params.append(table_type_filter)
+                    
+                    table_query += " ORDER BY table_schema, table_name"
+                    
+                    if query_params:
+                        tables = run_query_with_params(table_query, query_params, db)
+                    else:
+                        tables = run_query(table_query, db)
+                    
+                    results.append({
+                        "database": db,
+                        "tables": tables,
+                        "table_count": len(tables)
+                    })
+                    
+                except Exception as e:
+                    results.append({
+                        "database": db,
+                        "error": str(e),
+                        "tables": []
+                    })
+            
+            return {
+                "jsonrpc": "2.0",
+                "id": rpc.id,
+                "result": {
+                    "databases_queried": databases,
+                    "schema_filter": schema_filter,
+                    "table_type_filter": table_type_filter,
+                    "results": results,
+                    "total_tables": sum(r.get("table_count", 0) for r in results)
+                }
+            }
+
         elif method == "get_table_schema":
             database = params.get("database", "primary")
             table_name = params.get("table_name")
+            table_schema = params.get("table_schema", "public")  # Default to public schema
             include_indexes = params.get("include_indexes", False)
             include_constraints = params.get("include_constraints", False)
             
@@ -471,7 +572,7 @@ async def mcp_handler(req: Request):
                 }
             
             try:
-                # Get column information
+                # Get column information with schema
                 schema_query = """
                 SELECT 
                     column_name,
@@ -482,24 +583,26 @@ async def mcp_handler(req: Request):
                     numeric_precision,
                     numeric_scale,
                     ordinal_position,
-                    udt_name
+                    udt_name,
+                    table_schema
                 FROM information_schema.columns 
                 WHERE table_name = %s 
-                AND table_schema NOT IN ('information_schema', 'pg_catalog')
+                AND table_schema = %s
                 ORDER BY ordinal_position
                 """
-                columns = run_query_with_params(schema_query, [table_name], database)
+                columns = run_query_with_params(schema_query, [table_name, table_schema], database)
                 
                 if not columns:
                     return {
                         "jsonrpc": "2.0", 
-                        "error": {"code": -32000, "message": f"Table '{table_name}' not found"}, 
+                        "error": {"code": -32000, "message": f"Table '{table_schema}.{table_name}' not found"}, 
                         "id": rpc.id
                     }
                 
                 result = {
                     "database": database,
                     "table_name": table_name,
+                    "table_schema": table_schema,
                     "columns": columns,
                     "column_count": len(columns)
                 }
@@ -513,9 +616,9 @@ async def mcp_handler(req: Request):
                         CASE WHEN i.indexdef LIKE '%UNIQUE%' THEN true ELSE false END as is_unique
                     FROM pg_indexes i
                     WHERE i.tablename = %s
-                    AND i.schemaname NOT IN ('information_schema', 'pg_catalog')
+                    AND i.schemaname = %s
                     """
-                    indexes = run_query_with_params(index_query, [table_name], database)
+                    indexes = run_query_with_params(index_query, [table_name, table_schema], database)
                     result["indexes"] = indexes
                     result["index_count"] = len(indexes)
                 
@@ -527,15 +630,18 @@ async def mcp_handler(req: Request):
                         tc.constraint_type,
                         kcu.column_name,
                         ccu.table_name AS foreign_table_name,
-                        ccu.column_name AS foreign_column_name
+                        ccu.column_name AS foreign_column_name,
+                        tc.table_schema
                     FROM information_schema.table_constraints tc
                     LEFT JOIN information_schema.key_column_usage kcu 
                         ON tc.constraint_name = kcu.constraint_name
+                        AND tc.table_schema = kcu.table_schema
                     LEFT JOIN information_schema.constraint_column_usage ccu 
                         ON ccu.constraint_name = tc.constraint_name
                     WHERE tc.table_name = %s
+                    AND tc.table_schema = %s
                     """
-                    constraints = run_query_with_params(constraint_query, [table_name], database)
+                    constraints = run_query_with_params(constraint_query, [table_name, table_schema], database)
                     result["constraints"] = constraints
                     result["constraint_count"] = len(constraints)
                 
@@ -594,16 +700,16 @@ async def mcp_handler(req: Request):
                     # Get tables to search
                     if table_pattern:
                         search_query = """
-                        SELECT table_name FROM information_schema.tables 
+                        SELECT table_name, table_schema FROM information_schema.tables 
                         WHERE table_name ILIKE %s 
                         AND table_schema NOT IN ('information_schema', 'pg_catalog')
                         """
                         tables = run_query_with_params(search_query, [f'%{table_pattern}%'], db)
                     else:
                         tables_query = """
-                        SELECT DISTINCT t.table_name
+                        SELECT DISTINCT t.table_name, t.table_schema
                         FROM information_schema.tables t
-                        JOIN information_schema.columns c ON t.table_name = c.table_name
+                        JOIN information_schema.columns c ON t.table_name = c.table_name AND t.table_schema = c.table_schema
                         WHERE t.table_schema NOT IN ('information_schema', 'pg_catalog')
                         AND c.data_type IN ('text', 'varchar', 'character varying', 'char', 'json', 'jsonb')
                         LIMIT 50
@@ -613,32 +719,37 @@ async def mcp_handler(req: Request):
                     # Search in each table
                     for table_info in tables:
                         table_name = table_info['table_name']
+                        table_schema = table_info.get('table_schema', 'public')
+                        full_table_name = f'"{table_schema}"."{table_name}"'
+                        
                         try:
                             # Get searchable columns
                             col_query = """
                             SELECT column_name FROM information_schema.columns 
                             WHERE table_name = %s 
+                            AND table_schema = %s
                             AND data_type IN ('text', 'varchar', 'character varying', 'char', 'json', 'jsonb')
                             """
-                            columns = run_query_with_params(col_query, [table_name], db)
+                            columns = run_query_with_params(col_query, [table_name, table_schema], db)
                             
                             if columns:
                                 col_names = [col['column_name'] for col in columns]
                                 conditions = ' OR '.join([f'"{col}"::text {search_operator} %s' for col in col_names])
                                 search_params = [f'%{search_term}%'] * len(col_names)
                                 
-                                data_query = f'SELECT * FROM "{table_name}" WHERE {conditions} LIMIT {max_results_per_table}'
+                                data_query = f'SELECT * FROM {full_table_name} WHERE {conditions} LIMIT {max_results_per_table}'
                                 table_results = run_query_with_params(data_query, search_params, db)
                                 
                                 if table_results:
                                     db_results.append({
                                         "table": table_name,
+                                        "schema": table_schema,
                                         "matches": table_results,
                                         "match_count": len(table_results),
                                         "searched_columns": col_names
                                     })
                         except Exception as table_error:
-                            logger.warning(f"Error searching table {table_name} in {db}: {str(table_error)}")
+                            logger.warning(f"Error searching table {full_table_name} in {db}: {str(table_error)}")
                             continue
                     
                     results.append({
@@ -765,7 +876,7 @@ async def mcp_handler(req: Request):
 
         else:
             available_methods = [
-                "fetch_data", "execute_query", "get_table_names", "get_table_schema",
+                "fetch_data", "execute_query", "get_table_names", "get_all_tables", "get_table_schema",
                 "search_across_databases", "list_databases", "test_connection", "get_database_stats"
             ]
             return {
@@ -874,11 +985,11 @@ async def root():
     """Root endpoint with comprehensive server info"""
     return {
         "message": "Enhanced Multi-Database MCP Server",
-        "version": "3.0.0",
+        "version": "3.0.1",
         "configured_databases": list(DATABASE_CONFIGS.keys()),
         "active_pools": len(connection_pools),
         "available_methods": [
-            "fetch_data", "execute_query", "get_table_names", "get_table_schema",
+            "fetch_data", "execute_query", "get_table_names", "get_all_tables", "get_table_schema",
             "search_across_databases", "list_databases", "test_connection", "get_database_stats"
         ],
         "endpoints": {
@@ -892,7 +1003,8 @@ async def root():
             "Detailed database statistics",
             "Cross-database search",
             "Schema introspection",
-            "Health monitoring"
+            "Health monitoring",
+            "All-database table querying"
         ],
         "timestamp": datetime.now().isoformat()
     }
@@ -901,7 +1013,7 @@ if __name__ == "__main__":
     import uvicorn
     
     print("🚀 Starting Enhanced Multi-Database MCP Server...")
-    print(f"📊 Version: 3.0.0")
+    print(f"📊 Version: 3.0.1")
     
     # Print detected database configurations  
     print(f"\n🔍 Scanning .env file for POSTGRES_URL_* variables...")
