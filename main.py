@@ -1,5 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException, Header, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, Field
 import psycopg
 import os
@@ -35,10 +34,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Security
-security = HTTPBearer(auto_error=False)
-AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN")
 
 # Dynamically load database configurations from environment variables
 def load_database_configs():
@@ -199,19 +194,6 @@ class DatabaseInfo(BaseModel):
     active_connections: Optional[int] = None
     total_connections: Optional[int] = None
 
-def verify_auth(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> bool:
-    """Verify authentication token"""
-    if not AUTH_TOKEN:
-        return True  # Skip auth if no token configured
-    
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Authorization header required")
-    
-    if credentials.credentials != AUTH_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid authentication token")
-    
-    return True
-
 async def initialize_connection_pools():
     """Initialize connection pools for all configured databases"""
     global connection_pools
@@ -360,10 +342,7 @@ async def shutdown_event():
     await close_connection_pools()
 
 @app.post("/mcp")
-async def mcp_handler(
-    req: Request, 
-    authenticated: bool = Depends(verify_auth)
-):
+async def mcp_handler(req: Request):
     """Enhanced MCP handler with better error handling and new features"""
     try:
         body = await req.json()
@@ -910,7 +889,6 @@ async def root():
         },
         "features": [
             "Connection pooling",
-            "Enhanced authentication",
             "Detailed database statistics",
             "Cross-database search",
             "Schema introspection",
@@ -952,7 +930,7 @@ if __name__ == "__main__":
                 print(f"    🗃️  Tables: {info.get('table_count', 'N/A')}")
                 print(f"    💾 Size: {info.get('database_size_bytes', 0):,} bytes")
     
-    print(f"\n🔐 Authentication: {'Enabled' if AUTH_TOKEN else 'Disabled'}")
+    print(f"\n🔐 Authentication: Disabled")
     print("🌐 Server starting on http://0.0.0.0:8000")
     print("📚 API Documentation: http://0.0.0.0:8000/docs")
     print("🏥 Health Check: http://0.0.0.0:8000/health")
