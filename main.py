@@ -40,22 +40,30 @@ def load_database_configs():
     """
     Dynamically load database configurations from .env file
     Looks for POSTGRES_URL_* environment variables where * becomes the database name
+    Also supports DB_URL_* format for compatibility
     """
     configs = {}
     
     # Get all environment variables
     env_vars = os.environ
     
-    # Find all POSTGRES_URL_* variables
+    # Find all POSTGRES_URL_* and DB_URL_* variables
     for key, value in env_vars.items():
+        db_name = None
+        
         if key.startswith("POSTGRES_URL_") and value:
             # Extract database name from environment variable
             # POSTGRES_URL_PRIMARY -> primary (convert to lowercase)
             db_name = key.replace("POSTGRES_URL_", "").lower()
-            
+        elif key.startswith("DB_URL_") and value:
+            # Extract database name from DB_URL_* format
+            # DB_URL_SCHOOLSTATUS_CODE -> schoolstatus_code
+            db_name = key.replace("DB_URL_", "").lower()
+        
+        if db_name and value:
             # Default configuration values
             default_pool_size = "10" if db_name == "primary" else "5"
-            default_timeout = "60" if db_name in ["reporting", "reports"] else "30"
+            default_timeout = "60" if db_name in ["reporting", "reports", "schoolstatus_code"] else "30"
             
             # Build configuration for this database
             configs[db_name] = {
@@ -63,7 +71,7 @@ def load_database_configs():
                 "pool_size": int(os.getenv(f"POSTGRES_POOL_SIZE_{db_name.upper()}", default_pool_size)),
                 "max_overflow": int(os.getenv(f"POSTGRES_MAX_OVERFLOW_{db_name.upper()}", "20")),
                 "timeout": int(os.getenv(f"POSTGRES_TIMEOUT_{db_name.upper()}", default_timeout)),
-                "description": db_name
+                "description": db_name.replace("_", " ").title()
             }
     
     return configs
@@ -822,7 +830,115 @@ async def mcp_handler(req: Request):
                 }
             }
 
-        elif method == "get_database_stats":
+        elif method == "get_database_info":
+            """Get detailed information about a specific database including its actual database name"""
+            database = params.get("database", "primary")
+            
+            try:
+                # Get comprehensive database information
+                info_query = """
+                SELECT 
+                    current_database() as connected_database_name,
+                    current_user as connected_user,
+                    inet_server_addr() as server_address,
+                    inet_server_port() as server_port,
+                    version() as postgres_version,
+                    pg_database_size(current_database()) as database_size_bytes,
+                    (SELECT count(*) FROM information_schema.tables 
+                     WHERE table_schema NOT IN ('information_schema', 'pg_catalog')) as user_table_count,
+                    (SELECT array_agg(DISTINCT table_schema) 
+                     FROM information_schema.tables 
+                     WHERE table_schema NOT IN ('information_schema', 'pg_catalog')) as user_schemas,
+                    now() as server_time
+                """
+                
+                db_info = run_query(info_query, database)
+                
+                # Get list of all schemas with table counts
+                schema_query = """
+                SELECT 
+                    table_schema,
+                    count(*) as table_count,
+                    array_agg(table_name ORDER BY table_name) as tables
+                FROM information_schema.tables 
+                WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+                GROUP BY table_schema
+                ORDER BY table_schema
+                """
+                
+                schemas = run_query(schema_query, database)
+                
+                return {
+                    "jsonrpc": "2.0",
+                    "id": rpc.id,
+                    "result": {
+                        "database_config_name": database,
+                        "database_info": db_info[0] if db_info else {},
+                        "schemas": schemas,
+                        "schema_count": len(schemas),
+                        "timestamp": datetime.now().isoformat()
+                    }
+                }
+                
+            except Exception as e:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32000, "message": f"Failed to get database info: {str(e)}"}, 
+                    "id": rpc.id
+                }
+
+        elif method == "connect_to_database":
+            """Explicitly connect to a specific database and return connection details"""
+            database = params.get("database")
+            
+            if not database:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32602, "message": "database parameter is required"}, 
+                    "id": rpc.id
+                }
+            
+            try:
+                connected, message, info = test_database_connection(database)
+                
+                if not connected:
+                    return {
+                        "jsonrpc": "2.0", 
+                        "error": {"code": -32000, "message": f"Failed to connect to database '{database}': {message}"}, 
+                        "id": rpc.id
+                    }
+                
+                # Get the actual database name and available schemas
+                with get_sync_connection(database) as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            SELECT 
+                                current_database() as actual_db_name,
+                                array_agg(DISTINCT schema_name) as available_schemas
+                            FROM information_schema.schemata 
+                            WHERE schema_name NOT IN ('information_schema', 'pg_catalog')
+                        """)
+                        db_details = cur.fetchone()
+                
+                return {
+                    "jsonrpc": "2.0",
+                    "id": rpc.id,
+                    "result": {
+                        "database_config": database,
+                        "actual_database_name": db_details[0] if db_details else None,
+                        "available_schemas": db_details[1] if db_details else [],
+                        "connection_successful": True,
+                        "connection_info": info,
+                        "message": message
+                    }
+                }
+                
+            except Exception as e:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32000, "message": f"Error connecting to database: {str(e)}"}, 
+                    "id": rpc.id
+                }
             database = params.get("database", "primary")
             
             try:
@@ -877,7 +993,8 @@ async def mcp_handler(req: Request):
         else:
             available_methods = [
                 "fetch_data", "execute_query", "get_table_names", "get_all_tables", "get_table_schema",
-                "search_across_databases", "list_databases", "test_connection", "get_database_stats"
+                "search_across_databases", "list_databases", "test_connection", "get_database_stats",
+                "get_database_info", "connect_to_database"
             ]
             return {
                 "jsonrpc": "2.0", 
@@ -990,7 +1107,8 @@ async def root():
         "active_pools": len(connection_pools),
         "available_methods": [
             "fetch_data", "execute_query", "get_table_names", "get_all_tables", "get_table_schema",
-            "search_across_databases", "list_databases", "test_connection", "get_database_stats"
+            "search_across_databases", "list_databases", "test_connection", "get_database_stats",
+            "get_database_info", "connect_to_database"
         ],
         "endpoints": {
             "mcp": "/mcp",
@@ -1016,12 +1134,13 @@ if __name__ == "__main__":
     print(f"📊 Version: 3.0.1")
     
     # Print detected database configurations  
-    print(f"\n🔍 Scanning .env file for POSTGRES_URL_* variables...")
+    print(f"\n🔍 Scanning .env file for POSTGRES_URL_* and DB_URL_* variables...")
     
     if not DATABASE_CONFIGS:
         print("⚠️  WARNING: No databases configured!")
         print("\nTo add databases, add variables to your .env file like:")
         print("POSTGRES_URL_PRIMARY=postgresql://user:password@host:5432/database")
+        print("DB_URL_SCHOOLSTATUS_CODE=postgresql://user:password@host:5432/schoolstatus_code")
     else:
         print(f"✅ Found {len(DATABASE_CONFIGS)} database configurations:")
         
@@ -1041,17 +1160,11 @@ if __name__ == "__main__":
                 print(f"    📈 Response time: {info.get('response_time_ms', 'N/A')}ms")
                 print(f"    🗃️  Tables: {info.get('table_count', 'N/A')}")
                 print(f"    💾 Size: {info.get('database_size_bytes', 0):,} bytes")
-    
-    print(f"\n🔐 Authentication: Disabled")
-    print("🌐 Server starting on http://0.0.0.0:8000")
-    print("📚 API Documentation: http://0.0.0.0:8000/docs")
-    print("🏥 Health Check: http://0.0.0.0:8000/health")
-    print(f"\n💡 Tip: Add more databases by adding POSTGRES_URL_YOURNAME variables to .env")
-    print("🧪 To test your setup, run: python database_tester.py")
+
     
     uvicorn.run(
         app, 
         host="0.0.0.0", 
-        port=8000,
+        port=3000,
         log_level="info"
     )
