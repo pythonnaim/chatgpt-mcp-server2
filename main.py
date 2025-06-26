@@ -61,9 +61,9 @@ def load_database_configs():
             db_name = key.replace("DB_URL_", "").lower()
         
         if db_name and value:
-            # Default configuration values - no special treatment for "primary"
-            default_pool_size = "10"  # All databases get the same pool size
-            default_timeout = "60"    # All databases get the same timeout
+            # Single connection configuration - exactly 1 connection per database
+            default_pool_size = "1"  # Always exactly 1 connection
+            default_timeout = "60"
             
             # Build configuration for this database
             configs[db_name] = {
@@ -83,46 +83,74 @@ DATABASE_CONFIGS = load_database_configs()
 connection_pools: Dict[str, Queue] = {}
 pool_locks: Dict[str, threading.Lock] = {}
 
-class PersistentConnectionPool:
-    """Persistent connection pool that maintains connections and auto-reconnects"""
+class SingleConnectionManager:
+    """Single connection manager - maintains exactly one persistent connection per database"""
     
-    def __init__(self, database_url: str, pool_size: int = 10, timeout: int = 60):
+    def __init__(self, database_url: str, pool_size: int = 1, timeout: int = 60):
         self.database_url = database_url
-        self.pool_size = pool_size
+        self.pool_size = 1  # Always exactly 1
         self.timeout = timeout
-        self.pool = Queue(maxsize=pool_size)
+        self.connection = None
         self.lock = threading.Lock()
-        self.total_connections = 0
-        self.failed_connections = 0
-        self.is_healthy = True
+        self.is_healthy = False
+        self.connection_errors = []
+        self.last_successful_connection = None
+        self.last_health_check = 0
         
-        # Pre-fill the pool and keep connections alive
-        self._initialize_pool()
+        # Create the single connection
+        self._create_connection()
         
-        # Start background thread to maintain connections
-        self.maintenance_thread = threading.Thread(target=self._maintain_connections, daemon=True)
+        # Start background thread to maintain the connection
+        self.maintenance_thread = threading.Thread(target=self._maintain_connection, daemon=True)
         self.maintenance_thread.start()
     
-    def _initialize_pool(self):
-        """Initialize the connection pool with all connections"""
-        logger.info(f"Initializing persistent pool with {self.pool_size} connections...")
-        for i in range(self.pool_size):
+    def _create_connection(self):
+        """Create the single persistent connection"""
+        with self.lock:
             try:
-                conn = psycopg.connect(self.database_url)
-                conn.autocommit = True
-                self.pool.put(conn)
-                self.total_connections += 1
-                logger.debug(f"Created connection {i+1}/{self.pool_size}")
+                if self.connection and not self.connection.closed:
+                    return  # Connection already exists and is healthy
+                
+                logger.info("Creating single persistent connection...")
+                self.connection = psycopg.connect(
+                    self.database_url,
+                    connect_timeout=15,
+                    application_name="MCP-Server-Single"
+                )
+                self.connection.autocommit = True
+                
+                # Test the connection
+                with self.connection.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+                
+                self.is_healthy = True
+                self.last_successful_connection = time.time()
+                logger.info("✅ Single persistent connection established")
+                
             except Exception as e:
-                logger.error(f"Failed to create connection {i+1}: {e}")
-                self.failed_connections += 1
-                break
-        
-        self.is_healthy = self.total_connections > 0
-        logger.info(f"Pool initialized: {self.total_connections} active connections")
+                error_msg = str(e)
+                self.connection_errors.append(error_msg)
+                logger.error(f"Failed to create single connection: {error_msg}")
+                
+                if ("remaining connection slots are reserved" in error_msg or 
+                    "too many clients" in error_msg.lower()):
+                    self.is_healthy = False
+                    logger.warning("⚠️  Connection slots full - will retry in maintenance cycle")
+                else:
+                    self.is_healthy = False
+                    logger.error("❌ Connection failed - will retry in maintenance cycle")
+                
+                # Clean up failed connection
+                if self.connection:
+                    try:
+                        self.connection.close()
+                    except:
+                        pass
+                    self.connection = None
     
-    def _maintain_connections(self):
-        """Background thread to maintain connections"""
+    def _maintain_connection(self):
+        """Background thread to maintain the single connection"""
         while True:
             try:
                 time.sleep(30)  # Check every 30 seconds
@@ -131,23 +159,265 @@ class PersistentConnectionPool:
                 logger.error(f"Connection maintenance error: {e}")
     
     def _health_check(self):
-        """Check and repair connections in the pool"""
+        """Check and repair the single connection if needed"""
         with self.lock:
+            connection_needs_repair = False
+            
+            if not self.connection:
+                connection_needs_repair = True
+                logger.debug("No connection exists - creating new one")
+            elif self.connection.closed:
+                connection_needs_repair = True
+                logger.debug("Connection is closed - creating new one")
+            else:
+                # Test the existing connection
+                try:
+                    with self.connection.cursor() as cur:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                    # Connection is healthy
+                    self.is_healthy = True
+                    self.last_health_check = time.time()
+                    return
+                except Exception as e:
+                    connection_needs_repair = True
+                    logger.debug(f"Connection health check failed: {e}")
+            
+            # Repair the connection if needed
+            if connection_needs_repair:
+                if self.connection:
+                    try:
+                        self.connection.close()
+                    except:
+                        pass
+                    self.connection = None
+                
+                # Create new connection
+                self._create_connection()
+    
+    def get_connection(self):
+        """Get the single persistent connection"""
+        with self.lock:
+            if not self.is_healthy or not self.connection or self.connection.closed:
+                # Try to create connection if it doesn't exist or is unhealthy
+                self._create_connection()
+            
+            if not self.is_healthy or not self.connection or self.connection.closed:
+                # Still no connection - raise error
+                if self.connection_errors:
+                    last_error = self.connection_errors[-1]
+                    if "remaining connection slots are reserved" in last_error:
+                        raise Exception("Database connection limit reached. Server is at capacity - please try again later.")
+                    elif "too many clients" in last_error.lower():
+                        raise Exception("Too many database clients connected. Please wait and try again.")
+                    else:
+                        raise Exception(f"Database connection failed: {last_error}")
+                else:
+                    raise Exception("Database connection is not available")
+            
+            # Test connection before returning
+            try:
+                with self.connection.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+                return self.connection
+            except Exception as e:
+                logger.warning(f"Connection test failed during get_connection: {e}")
+                # Mark for repair and try once more
+                self.is_healthy = False
+                self._create_connection()
+                
+                if self.is_healthy and self.connection and not self.connection.closed:
+                    return self.connection
+                else:
+                    raise Exception("Unable to establish database connection")
+    
+    def return_connection(self, conn):
+        """Return the connection (no-op since we reuse the same connection)"""
+        # Do nothing - we keep the single connection alive
+        pass
+    
+    def close_all(self):
+        """Close the single connection"""
+        with self.lock:
+            if self.connection:
+                try:
+                    self.connection.close()
+                    logger.info("Closed single persistent connection")
+                except Exception as e:
+                    logger.error(f"Error closing connection: {e}")
+                finally:
+                    self.connection = None
+            self.is_healthy = False
+    
+    def get_stats(self):
+        """Get connection statistics"""
+        return {
+            "total_connections": 1 if (self.connection and not self.connection.closed) else 0,
+            "available_connections": 1 if self.is_healthy else 0,
+            "max_connections": 1,
+            "failed_connections": len(self.connection_errors),
+            "is_healthy": self.is_healthy,
+            "connection_mode": "single-persistent",
+            "last_successful_connection": self.last_successful_connection,
+            "last_health_check": self.last_health_check,
+            "connection_closed": self.connection.closed if self.connection else True,
+            "recent_errors": self.connection_errors[-3:] if self.connection_errors else []
+        }
+class AdaptiveConnectionPool:
+    """Adaptive connection pool that adjusts to server limits and maintains minimal connections"""
+    
+    def __init__(self, database_url: str, pool_size: int = 3, timeout: int = 60):
+        self.database_url = database_url
+        self.pool_size = pool_size
+        self.timeout = timeout
+        self.pool = Queue(maxsize=pool_size) if pool_size > 0 else None
+        self.lock = threading.Lock()
+        self.total_connections = 0
+        self.failed_connections = 0
+        self.is_healthy = False
+        self.max_connection_attempts = 3
+        self.last_health_check = 0
+        self.connection_errors = []
+        
+        if pool_size == 0:
+            # Zero-pool mode - no persistent connections
+            self._test_connection_capability()
+        else:
+            # Try to initialize with minimal connections
+            self._initialize_pool()
+            
+            # Start background thread to maintain connections (less aggressive)
+            self.maintenance_thread = threading.Thread(target=self._maintain_connections, daemon=True)
+            self.maintenance_thread.start()
+    
+    def _test_connection_capability(self):
+        """Test if we can connect without maintaining a pool"""
+        try:
+            conn = psycopg.connect(
+                self.database_url,
+                connect_timeout=10,
+                application_name="MCP-Server-Test"
+            )
+            conn.autocommit = True
+            
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            
+            conn.close()
+            self.is_healthy = True
+            logger.info("✅ Zero-pool connection test successful")
+            
+        except Exception as e:
+            error_msg = str(e)
+            self.connection_errors.append(error_msg)
+            logger.warning(f"⚠️  Connection test failed: {error_msg}")
+            
+            if ("remaining connection slots" in error_msg or 
+                "too many clients" in error_msg.lower()):
+                self.is_healthy = True  # Still usable, just limited
+            else:
+                self.is_healthy = False
+    
+    def _initialize_pool(self):
+        """Initialize the connection pool with minimal connections"""
+        logger.info(f"Initializing adaptive pool with up to {self.pool_size} connections...")
+        
+        # Start with just 1 connection to test
+        initial_connections = 1
+        
+        for i in range(initial_connections):
+            try:
+                conn = psycopg.connect(
+                    self.database_url,
+                    connect_timeout=10,
+                    application_name="MCP-Server"
+                )
+                conn.autocommit = True
+                
+                # Test the connection
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                
+                self.pool.put(conn)
+                self.total_connections += 1
+                self.is_healthy = True
+                logger.info(f"✅ Created initial connection {i+1}")
+                break
+                
+            except Exception as e:
+                error_msg = str(e)
+                self.connection_errors.append(error_msg)
+                logger.error(f"Failed to create initial connection {i+1}: {error_msg}")
+                
+                # Check for specific connection limit errors
+                if "remaining connection slots are reserved" in error_msg:
+                    logger.warning(f"Database connection limit reached. Switching to zero-pool mode.")
+                    self.pool_size = 0  # Switch to zero-pool mode
+                    self.pool = None
+                    self.is_healthy = True  # Still mark as healthy for on-demand
+                    break
+                elif "too many clients" in error_msg.lower():
+                    logger.warning(f"Too many clients connected. Switching to zero-pool mode.")
+                    self.pool_size = 0
+                    self.pool = None
+                    self.is_healthy = True
+                    break
+                
+                self.failed_connections += 1
+        
+        if self.total_connections == 0 and self.pool_size > 0:
+            logger.warning(f"No initial connections created. Switching to zero-pool mode.")
+            self.pool_size = 0
+            self.pool = None
+            self.is_healthy = True
+        elif self.total_connections > 0:
+            logger.info(f"Pool initialized: {self.total_connections} active connections")
+    
+    def _maintain_connections(self):
+        """Background thread to maintain connections (less aggressive)"""
+        while self.pool_size > 0:  # Only run if we have pooling enabled
+            try:
+                time.sleep(60)  # Check every minute
+                current_time = time.time()
+                
+                # Only do health checks if we have existing connections
+                if self.total_connections > 0:
+                    self._health_check()
+                
+                self.last_health_check = current_time
+                
+            except Exception as e:
+                logger.error(f"Connection maintenance error: {e}")
+    
+    def _health_check(self):
+        """Check and repair connections in the pool (gentler approach)"""
+        if self.pool_size == 0 or not self.pool:
+            return  # No pooling
+            
+        with self.lock:
+            if self.total_connections == 0:
+                return
+            
             healthy_connections = []
             
-            # Check all existing connections
+            # Check existing connections
             while not self.pool.empty():
                 try:
                     conn = self.pool.get(block=False)
-                    # Test the connection
-                    with conn.cursor() as cur:
-                        cur.execute("SELECT 1")
-                        cur.fetchone()
-                    healthy_connections.append(conn)
+                    if not conn.closed:
+                        # Quick health check
+                        with conn.cursor() as cur:
+                            cur.execute("SELECT 1")
+                            cur.fetchone()
+                        healthy_connections.append(conn)
+                    else:
+                        self.total_connections -= 1
                 except Exception:
                     # Connection is dead
                     try:
-                        conn.close()
+                        if not conn.closed:
+                            conn.close()
                     except:
                         pass
                     self.total_connections -= 1
@@ -156,71 +426,119 @@ class PersistentConnectionPool:
             for conn in healthy_connections:
                 self.pool.put(conn)
             
-            # Create new connections if needed
-            missing_connections = self.pool_size - len(healthy_connections)
-            for _ in range(missing_connections):
+            # Only create new connections if we have none and pool size allows
+            if len(healthy_connections) == 0 and self.pool_size > 0:
                 try:
-                    conn = psycopg.connect(self.database_url)
+                    conn = psycopg.connect(
+                        self.database_url,
+                        connect_timeout=10,
+                        application_name="MCP-Server"
+                    )
                     conn.autocommit = True
+                    
+                    # Test the connection
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                    
                     self.pool.put(conn)
                     self.total_connections += 1
+                    logger.info(f"Repaired connection. Active: {self.total_connections}")
+                    
                 except Exception as e:
                     logger.warning(f"Failed to create replacement connection: {e}")
-                    break
+                    # If we can't create connections, switch to zero-pool mode
+                    if "remaining connection slots" in str(e) or "too many clients" in str(e).lower():
+                        logger.info("Switching to zero-pool mode due to connection limits")
+                        self.pool_size = 0
+                        # Close remaining connections
+                        while not self.pool.empty():
+                            try:
+                                conn = self.pool.get(block=False)
+                                conn.close()
+                            except:
+                                pass
+                        self.total_connections = 0
             
-            self.is_healthy = self.total_connections > 0
-            if missing_connections > 0:
-                logger.info(f"Repaired {missing_connections} connections. Active: {self.total_connections}")
+            self.is_healthy = True  # Always mark as healthy - we'll handle on-demand
     
     def get_connection(self):
-        """Get a connection from the pool"""
-        if not self.is_healthy:
-            raise Exception("Connection pool is unhealthy")
+        """Get a connection from the pool or create on-demand"""
+        # Zero-pool mode - always create on-demand
+        if self.pool_size == 0 or not self.pool:
+            return self._create_on_demand_connection()
         
+        # Try to get from pool first
         try:
-            # Try to get an existing connection
-            conn = self.pool.get(timeout=5)
+            conn = self.pool.get(timeout=2)
             
             # Quick test if connection is still alive
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                return conn
-            except Exception:
-                # Connection is dead, get another one
+            if not conn.closed:
                 try:
-                    conn.close()
-                except:
-                    pass
-                self.total_connections -= 1
-                # Try to get another connection
-                return self.get_connection()
-                
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                    return conn
+                except Exception:
+                    # Connection is dead, close it and create new one
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                    self.total_connections -= 1
+            
         except Empty:
-            # No connections available, create a temporary one
-            try:
-                conn = psycopg.connect(self.database_url)
-                conn.autocommit = True
-                return conn
-            except Exception as e:
-                logger.error(f"Failed to create temporary connection: {e}")
-                raise Exception("No connections available and failed to create new one")
+            pass  # No connections available in pool
+        
+        # Create on-demand connection
+        return self._create_on_demand_connection()
+    
+    def _create_on_demand_connection(self):
+        """Create an on-demand connection"""
+        try:
+            logger.debug("Creating on-demand connection")
+            conn = psycopg.connect(
+                self.database_url,
+                connect_timeout=15,
+                application_name="MCP-Server-OnDemand"
+            )
+            conn.autocommit = True
+            
+            # Test the connection
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            
+            return conn
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Failed to create on-demand connection: {error_msg}")
+            
+            if "remaining connection slots are reserved" in error_msg:
+                raise Exception("Database connection limit reached. Server may be at capacity - please try again in a moment.")
+            elif "too many clients" in error_msg.lower():
+                raise Exception("Too many database clients connected. Please try again later.")
+            else:
+                raise Exception(f"Database connection failed: {error_msg}")
     
     def return_connection(self, conn):
-        """Return a connection to the pool"""
+        """Return a connection to the pool or close it"""
+        if self.pool_size == 0 or not self.pool:
+            # Zero-pool mode - always close
+            try:
+                if conn and not conn.closed:
+                    conn.close()
+            except:
+                pass
+            return
+        
+        # Normal pool mode
         try:
             if not conn.closed and not self.pool.full():
                 self.pool.put(conn, block=False)
             else:
-                # Pool is full or connection is bad, close it
                 try:
                     conn.close()
                 except:
                     pass
-                if not conn.closed:
-                    self.total_connections -= 1
         except Exception:
-            # Couldn't return to pool, close it
             try:
                 conn.close()
             except:
@@ -228,24 +546,27 @@ class PersistentConnectionPool:
     
     def close_all(self):
         """Close all connections in the pool"""
-        with self.lock:
-            while not self.pool.empty():
-                try:
-                    conn = self.pool.get(block=False)
-                    conn.close()
-                except:
-                    pass
-            self.total_connections = 0
-            self.is_healthy = False
+        if self.pool:
+            with self.lock:
+                while not self.pool.empty():
+                    try:
+                        conn = self.pool.get(block=False)
+                        conn.close()
+                    except:
+                        pass
+        self.total_connections = 0
+        self.is_healthy = False
     
     def get_stats(self):
         """Get pool statistics"""
         return {
             "total_connections": self.total_connections,
-            "available_connections": self.pool.qsize(),
+            "available_connections": self.pool.qsize() if self.pool else 0,
             "max_connections": self.pool_size,
             "failed_connections": self.failed_connections,
-            "is_healthy": self.is_healthy
+            "is_healthy": self.is_healthy,
+            "connection_mode": "zero-pool" if self.pool_size == 0 else "pooled",
+            "recent_errors": self.connection_errors[-3:] if self.connection_errors else []
         }
 
 class JsonRpcRequest(BaseModel):
@@ -265,7 +586,7 @@ class DatabaseInfo(BaseModel):
     total_connections: Optional[int] = None
 
 async def initialize_connection_pools():
-    """Initialize persistent connection pools for all configured databases"""
+    """Initialize single persistent connections for all configured databases"""
     global connection_pools
     
     if not DATABASE_CONFIGS:
@@ -274,39 +595,41 @@ async def initialize_connection_pools():
     
     for db_name, config in DATABASE_CONFIGS.items():
         try:
-            logger.info(f"Initializing persistent connection pool for {db_name}...")
+            logger.info(f"Initializing single persistent connection for {db_name}...")
             
-            pool = PersistentConnectionPool(
+            manager = SingleConnectionManager(
                 config["url"],
-                pool_size=config["pool_size"],
+                pool_size=1,  # Always 1
                 timeout=config["timeout"]
             )
             
-            if pool.is_healthy:
-                connection_pools[db_name] = pool
-                logger.info(f"✅ Persistent connection pool initialized for {db_name}")
+            # Always add the manager - it will handle connection issues internally
+            connection_pools[db_name] = manager
+            
+            if manager.is_healthy:
+                logger.info(f"✅ Single persistent connection ready for {db_name}")
             else:
-                logger.error(f"❌ Failed to initialize healthy pool for {db_name}")
+                logger.warning(f"⚠️  Connection for {db_name} will retry automatically")
             
         except Exception as e:
-            logger.error(f"❌ Failed to initialize pool for {db_name}: {str(e)}")
+            logger.error(f"❌ Failed to initialize connection manager for {db_name}: {str(e)}")
 
 async def close_connection_pools():
-    """Close all connection pools"""
+    """Close all single connections"""
     global connection_pools
     
-    for db_name, pool in connection_pools.items():
+    for db_name, manager in connection_pools.items():
         try:
-            pool.close_all()
-            logger.info(f"Closed connection pool for {db_name}")
+            manager.close_all()
+            logger.info(f"Closed single connection for {db_name}")
         except Exception as e:
-            logger.error(f"Error closing pool for {db_name}: {str(e)}")
+            logger.error(f"Error closing connection for {db_name}: {str(e)}")
     
     connection_pools.clear()
 
 @contextmanager
 def get_sync_connection(database: str):
-    """Get a synchronous database connection with proper error handling and pooling"""
+    """Get a synchronous database connection using single persistent connection"""
     if not database:
         # If no database specified, use the first available one
         if DATABASE_CONFIGS:
@@ -323,32 +646,48 @@ def get_sync_connection(database: str):
     if not db_config["url"]:
         raise ValueError(f"Database '{database}' URL is not configured")
     
-    # Try to use persistent connection pool first
+    # Use single persistent connection manager
     if database in connection_pools:
-        pool = connection_pools[database]
+        manager = connection_pools[database]
         conn = None
         try:
-            conn = pool.get_connection()
+            conn = manager.get_connection()
             yield conn
         except Exception as e:
-            logger.error(f"Pool connection error for {database}: {str(e)}")
-            raise
+            error_msg = str(e)
+            logger.error(f"Single connection error for {database}: {error_msg}")
+            
+            # Provide helpful error messages for common issues
+            if "connection limit reached" in error_msg.lower() or "remaining connection slots" in error_msg:
+                raise Exception(f"Database '{database}' has reached its connection limit. Please try again in a moment.")
+            elif "too many clients" in error_msg.lower():
+                raise Exception(f"Database '{database}' has too many active connections. Please try again later.")
+            else:
+                raise Exception(f"Connection to '{database}' failed: {error_msg}")
         finally:
             if conn:
-                pool.return_connection(conn)
+                manager.return_connection(conn)  # No-op for single connection
     else:
-        # Fallback to direct connection (shouldn't happen with persistent pools)
-        logger.warning(f"No pool available for {database}, creating direct connection")
+        # Fallback to direct connection (shouldn't happen)
+        logger.warning(f"No connection manager available for {database}, creating direct connection")
         try:
             with psycopg.connect(
                 db_config["url"], 
                 autocommit=True,
-                connect_timeout=db_config["timeout"]
+                connect_timeout=15,
+                application_name="MCP-Server-Direct"
             ) as conn:
                 yield conn
         except Exception as e:
-            logger.error(f"Direct connection error for {database}: {str(e)}")
-            raise
+            error_msg = str(e)
+            logger.error(f"Direct connection error for {database}: {error_msg}")
+            
+            if "remaining connection slots are reserved" in error_msg:
+                raise Exception(f"Database '{database}' connection limit reached. Server may be at capacity.")
+            elif "too many clients" in error_msg.lower():
+                raise Exception(f"Database '{database}' has too many active connections.")
+            else:
+                raise Exception(f"Failed to connect to '{database}': {error_msg}")
 
 def get_pool_stats(database: str) -> dict:
     """Get connection pool statistics"""
@@ -1217,7 +1556,7 @@ async def root():
     """Root endpoint with comprehensive server info"""
     return {
         "message": "Enhanced Multi-Database MCP Server",
-        "version": "3.0.2",
+        "version": "3.1.0",
         "configured_databases": list(DATABASE_CONFIGS.keys()),
         "active_pools": len(connection_pools),
         "available_methods": [
@@ -1237,7 +1576,10 @@ async def root():
             "Cross-database search",
             "Schema introspection",
             "Health monitoring",
-            "All-database table querying"
+            "All-database table querying",
+            "Single persistent connections",
+            "Connection limit handling",
+            "Auto-reconnection"
         ],
         "timestamp": datetime.now().isoformat()
     }
@@ -1246,7 +1588,7 @@ if __name__ == "__main__":
     import uvicorn
     
     print("🚀 Starting Enhanced Multi-Database MCP Server...")
-    print(f"📊 Version: 3.0.2 - Persistent Connections")
+    print(f"📊 Version: 3.1.0 - Single Persistent Connections")
     
     # Print detected database configurations  
     print(f"\n🔍 Scanning .env file for POSTGRES_URL_* and DB_URL_* variables...")
@@ -1257,33 +1599,46 @@ if __name__ == "__main__":
         print("POSTGRES_URL_SCHOOLSTATUS_CODE=postgresql://user:password@host:5432/database")
         print("DB_URL_SCHOOLSTATUS_CODE=postgresql://user:password@host:5432/schoolstatus_code")
         print("\n❌ Cannot start server without database configurations!")
+        return
     else:
         print(f"✅ Found {len(DATABASE_CONFIGS)} database configurations:")
         
-        # Show discovered databases
+        # Show discovered databases with single connection info
         for db_key, config in DATABASE_CONFIGS.items():
             print(f"   • {db_key} → {config['description']}")
-            print(f"     Pool: {config['pool_size']}, Timeout: {config['timeout']}s")
+            print(f"     Single Connection: ✅ Always exactly 1 connection")
         
-        # Test connections on startup
+        # Test connections on startup (but don't fail if some don't work)
         print("\n🔍 Testing database connections...")
         healthy_dbs = 0
+        problematic_dbs = []
+        
         for db_name in DATABASE_CONFIGS.keys():
             connected, message, info = test_database_connection(db_name)
-            status = "✅" if connected else "❌"
+            status = "✅" if connected else "⚠️"
             description = DATABASE_CONFIGS[db_name]["description"]
             print(f"{status} {db_name} ({description}): {message}")
+            
             if connected:
                 healthy_dbs += 1
                 if info:
                     print(f"    📈 Response time: {info.get('response_time_ms', 'N/A')}ms")
                     print(f"    🗃️  Tables: {info.get('table_count', 'N/A')}")
                     print(f"    💾 Size: {info.get('database_size_bytes', 0):,} bytes")
+            else:
+                problematic_dbs.append(db_name)
+                if "connection slots are reserved" in message or "too many clients" in message.lower():
+                    print(f"    🔄 Single connection will retry automatically")
         
+        print(f"\n🎯 Ready to serve all {len(DATABASE_CONFIGS)} databases")
+        print("🔗 Each database uses exactly 1 persistent connection")
         
-        print(f"\n🎯 Ready to serve {healthy_dbs}/{len(DATABASE_CONFIGS)} databases")
-        print("⚡ All connections will remain persistent and auto-reconnect")
-        print("📋 Database parameter is now REQUIRED for all queries")
+        if problematic_dbs:
+            print(f"⚠️  Databases needing retry: {', '.join(problematic_dbs)}")
+            print("   Single connections will auto-reconnect when server capacity allows")
+        
+        print("🔄 Auto-reconnection every 30 seconds")
+        print("📋 Database parameter is REQUIRED for all queries")
     
     print(f"\n🔐 Authentication: Disabled")
     print("🌐 Server starting on http://0.0.0.0:8000")
@@ -1291,12 +1646,12 @@ if __name__ == "__main__":
     print("🏥 Health Check: http://0.0.0.0:8000/health")
     print(f"\n💡 Tip: Add more databases by adding POSTGRES_URL_YOURNAME or DB_URL_YOURNAME variables to .env")
     print("🧪 To test your setup, run: python database_tester.py")
-    print("\n🚨 NOTE: 'database' parameter is now REQUIRED for all queries!")
+    print("\n🚨 NOTE: 'database' parameter is REQUIRED for all queries!")
     print(f"Available databases: {', '.join(DATABASE_CONFIGS.keys())}")
     
     uvicorn.run(
         app, 
         host="0.0.0.0", 
-        port=3000,
+        port=8000,
         log_level="info"
     )
