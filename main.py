@@ -61,9 +61,9 @@ def load_database_configs():
             db_name = key.replace("DB_URL_", "").lower()
         
         if db_name and value:
-            # Default configuration values
-            default_pool_size = "10" if db_name == "primary" else "5"
-            default_timeout = "60" if db_name in ["reporting", "reports", "schoolstatus_code"] else "30"
+            # Default configuration values - no special treatment for "primary"
+            default_pool_size = "10"  # All databases get the same pool size
+            default_timeout = "60"    # All databases get the same timeout
             
             # Build configuration for this database
             configs[db_name] = {
@@ -83,112 +83,169 @@ DATABASE_CONFIGS = load_database_configs()
 connection_pools: Dict[str, Queue] = {}
 pool_locks: Dict[str, threading.Lock] = {}
 
-class SimpleConnectionPool:
-    """Simple connection pool implementation"""
+class PersistentConnectionPool:
+    """Persistent connection pool that maintains connections and auto-reconnects"""
     
-    def __init__(self, database_url: str, pool_size: int = 10, timeout: int = 30):
+    def __init__(self, database_url: str, pool_size: int = 10, timeout: int = 60):
         self.database_url = database_url
         self.pool_size = pool_size
         self.timeout = timeout
         self.pool = Queue(maxsize=pool_size)
         self.lock = threading.Lock()
         self.total_connections = 0
+        self.failed_connections = 0
+        self.is_healthy = True
         
-        # Pre-fill the pool
+        # Pre-fill the pool and keep connections alive
         self._initialize_pool()
+        
+        # Start background thread to maintain connections
+        self.maintenance_thread = threading.Thread(target=self._maintain_connections, daemon=True)
+        self.maintenance_thread.start()
     
     def _initialize_pool(self):
-        """Initialize the connection pool"""
-        for _ in range(min(3, self.pool_size)):  # Start with 3 connections
+        """Initialize the connection pool with all connections"""
+        logger.info(f"Initializing persistent pool with {self.pool_size} connections...")
+        for i in range(self.pool_size):
             try:
-                conn = psycopg.connect(self.database_url, autocommit=True)
+                conn = psycopg.connect(self.database_url)
+                conn.autocommit = True
                 self.pool.put(conn)
                 self.total_connections += 1
+                logger.debug(f"Created connection {i+1}/{self.pool_size}")
             except Exception as e:
-                logger.error(f"Failed to create initial connection: {e}")
+                logger.error(f"Failed to create connection {i+1}: {e}")
+                self.failed_connections += 1
                 break
+        
+        self.is_healthy = self.total_connections > 0
+        logger.info(f"Pool initialized: {self.total_connections} active connections")
+    
+    def _maintain_connections(self):
+        """Background thread to maintain connections"""
+        while True:
+            try:
+                time.sleep(30)  # Check every 30 seconds
+                self._health_check()
+            except Exception as e:
+                logger.error(f"Connection maintenance error: {e}")
+    
+    def _health_check(self):
+        """Check and repair connections in the pool"""
+        with self.lock:
+            healthy_connections = []
+            
+            # Check all existing connections
+            while not self.pool.empty():
+                try:
+                    conn = self.pool.get(block=False)
+                    # Test the connection
+                    with conn.cursor() as cur:
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                    healthy_connections.append(conn)
+                except Exception:
+                    # Connection is dead
+                    try:
+                        conn.close()
+                    except:
+                        pass
+                    self.total_connections -= 1
+            
+            # Put healthy connections back
+            for conn in healthy_connections:
+                self.pool.put(conn)
+            
+            # Create new connections if needed
+            missing_connections = self.pool_size - len(healthy_connections)
+            for _ in range(missing_connections):
+                try:
+                    conn = psycopg.connect(self.database_url)
+                    conn.autocommit = True
+                    self.pool.put(conn)
+                    self.total_connections += 1
+                except Exception as e:
+                    logger.warning(f"Failed to create replacement connection: {e}")
+                    break
+            
+            self.is_healthy = self.total_connections > 0
+            if missing_connections > 0:
+                logger.info(f"Repaired {missing_connections} connections. Active: {self.total_connections}")
     
     def get_connection(self):
         """Get a connection from the pool"""
+        if not self.is_healthy:
+            raise Exception("Connection pool is unhealthy")
+        
         try:
             # Try to get an existing connection
-            conn = self.pool.get(block=False)
+            conn = self.pool.get(timeout=5)
             
-            # Test if connection is still alive
+            # Quick test if connection is still alive
             try:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
                 return conn
             except Exception:
-                # Connection is dead, create a new one
+                # Connection is dead, get another one
                 try:
                     conn.close()
                 except:
                     pass
                 self.total_connections -= 1
+                # Try to get another connection
+                return self.get_connection()
+                
         except Empty:
-            pass
-        
-        # Create new connection if pool is empty or connection was dead
-        with self.lock:
-            if self.total_connections < self.pool_size:
-                try:
-                    conn = psycopg.connect(self.database_url, autocommit=True)
-                    self.total_connections += 1
-                    return conn
-                except Exception as e:
-                    logger.error(f"Failed to create new connection: {e}")
-                    raise
-        
-        # Wait for a connection to become available
-        try:
-            conn = self.pool.get(timeout=self.timeout)
-            # Test the connection
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-            return conn
-        except Empty:
-            raise Exception("Connection pool timeout")
-        except Exception:
-            # Connection is dead, try one more time
+            # No connections available, create a temporary one
             try:
-                conn.close()
-            except:
-                pass
-            self.total_connections -= 1
-            raise Exception("Failed to get valid connection from pool")
+                conn = psycopg.connect(self.database_url)
+                conn.autocommit = True
+                return conn
+            except Exception as e:
+                logger.error(f"Failed to create temporary connection: {e}")
+                raise Exception("No connections available and failed to create new one")
     
     def return_connection(self, conn):
         """Return a connection to the pool"""
         try:
-            if not conn.closed:
+            if not conn.closed and not self.pool.full():
                 self.pool.put(conn, block=False)
             else:
-                self.total_connections -= 1
+                # Pool is full or connection is bad, close it
+                try:
+                    conn.close()
+                except:
+                    pass
+                if not conn.closed:
+                    self.total_connections -= 1
         except Exception:
-            # Pool is full or connection is bad
+            # Couldn't return to pool, close it
             try:
                 conn.close()
             except:
                 pass
-            self.total_connections -= 1
     
     def close_all(self):
         """Close all connections in the pool"""
-        while not self.pool.empty():
-            try:
-                conn = self.pool.get(block=False)
-                conn.close()
-            except:
-                pass
-        self.total_connections = 0
+        with self.lock:
+            while not self.pool.empty():
+                try:
+                    conn = self.pool.get(block=False)
+                    conn.close()
+                except:
+                    pass
+            self.total_connections = 0
+            self.is_healthy = False
     
     def get_stats(self):
         """Get pool statistics"""
         return {
             "total_connections": self.total_connections,
             "available_connections": self.pool.qsize(),
-            "max_connections": self.pool_size
+            "max_connections": self.pool_size,
+            "failed_connections": self.failed_connections,
+            "is_healthy": self.is_healthy
         }
 
 class JsonRpcRequest(BaseModel):
@@ -208,34 +265,31 @@ class DatabaseInfo(BaseModel):
     total_connections: Optional[int] = None
 
 async def initialize_connection_pools():
-    """Initialize connection pools for all configured databases"""
+    """Initialize persistent connection pools for all configured databases"""
     global connection_pools
+    
+    if not DATABASE_CONFIGS:
+        logger.warning("No database configurations found!")
+        return
     
     for db_name, config in DATABASE_CONFIGS.items():
         try:
-            logger.info(f"Initializing connection pool for {db_name}...")
+            logger.info(f"Initializing persistent connection pool for {db_name}...")
             
-            pool = SimpleConnectionPool(
+            pool = PersistentConnectionPool(
                 config["url"],
                 pool_size=config["pool_size"],
                 timeout=config["timeout"]
             )
             
-            # Test the pool with a simple query
-            conn = pool.get_connection()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1")
-                    cur.fetchone()
-            finally:
-                pool.return_connection(conn)
-            
-            connection_pools[db_name] = pool
-            logger.info(f"✅ Connection pool initialized for {db_name}")
+            if pool.is_healthy:
+                connection_pools[db_name] = pool
+                logger.info(f"✅ Persistent connection pool initialized for {db_name}")
+            else:
+                logger.error(f"❌ Failed to initialize healthy pool for {db_name}")
             
         except Exception as e:
             logger.error(f"❌ Failed to initialize pool for {db_name}: {str(e)}")
-            # Don't add to pools if initialization failed
 
 async def close_connection_pools():
     """Close all connection pools"""
@@ -251,8 +305,16 @@ async def close_connection_pools():
     connection_pools.clear()
 
 @contextmanager
-def get_sync_connection(database: str = "primary"):
+def get_sync_connection(database: str):
     """Get a synchronous database connection with proper error handling and pooling"""
+    if not database:
+        # If no database specified, use the first available one
+        if DATABASE_CONFIGS:
+            database = list(DATABASE_CONFIGS.keys())[0]
+            logger.info(f"No database specified, using first available: {database}")
+        else:
+            raise ValueError("No database specified and no databases configured")
+    
     if database not in DATABASE_CONFIGS:
         available = list(DATABASE_CONFIGS.keys())
         raise ValueError(f"Database '{database}' not found. Available: {available}")
@@ -261,7 +323,7 @@ def get_sync_connection(database: str = "primary"):
     if not db_config["url"]:
         raise ValueError(f"Database '{database}' URL is not configured")
     
-    # Try to use connection pool first
+    # Try to use persistent connection pool first
     if database in connection_pools:
         pool = connection_pools[database]
         conn = None
@@ -275,7 +337,8 @@ def get_sync_connection(database: str = "primary"):
             if conn:
                 pool.return_connection(conn)
     else:
-        # Fallback to direct connection
+        # Fallback to direct connection (shouldn't happen with persistent pools)
+        logger.warning(f"No pool available for {database}, creating direct connection")
         try:
             with psycopg.connect(
                 db_config["url"], 
@@ -373,13 +436,20 @@ async def mcp_handler(req: Request):
     try:
         if method == "fetch_data":
             query = params.get("query")
-            database = params.get("database", "primary")
+            database = params.get("database")  # Remove default, make it required
             limit = params.get("limit", None)
             
             if not query:
                 return {
                     "jsonrpc": "2.0", 
                     "error": {"code": -32602, "message": "query parameter is required"}, 
+                    "id": rpc.id
+                }
+            
+            if not database:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32602, "message": "database parameter is required. Available databases: " + ", ".join(DATABASE_CONFIGS.keys())}, 
                     "id": rpc.id
                 }
             
@@ -401,12 +471,19 @@ async def mcp_handler(req: Request):
 
         elif method == "execute_query":
             query = params.get("query")
-            database = params.get("database", "primary")
+            database = params.get("database")  # Remove default, make it required
             
             if not query:
                 return {
                     "jsonrpc": "2.0", 
                     "error": {"code": -32602, "message": "query parameter is required"}, 
+                    "id": rpc.id
+                }
+            
+            if not database:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32602, "message": "database parameter is required. Available databases: " + ", ".join(DATABASE_CONFIGS.keys())}, 
                     "id": rpc.id
                 }
             
@@ -422,9 +499,16 @@ async def mcp_handler(req: Request):
             }
 
         elif method == "get_table_names":
-            database = params.get("database", "primary")
+            database = params.get("database")  # Remove default, make it required
             schema_filter = params.get("schema", None)
             table_type_filter = params.get("table_type", None)  # BASE TABLE, VIEW, etc.
+            
+            if not database:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32602, "message": "database parameter is required. Available databases: " + ", ".join(DATABASE_CONFIGS.keys())}, 
+                    "id": rpc.id
+                }
             
             # Test connection first
             connected, message, _ = test_database_connection(database)
@@ -566,11 +650,18 @@ async def mcp_handler(req: Request):
             }
 
         elif method == "get_table_schema":
-            database = params.get("database", "primary")
+            database = params.get("database")  # Remove default, make it required
             table_name = params.get("table_name")
             table_schema = params.get("table_schema", "public")  # Default to public schema
             include_indexes = params.get("include_indexes", False)
             include_constraints = params.get("include_constraints", False)
+            
+            if not database:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32602, "message": "database parameter is required. Available databases: " + ", ".join(DATABASE_CONFIGS.keys())}, 
+                    "id": rpc.id
+                }
             
             if not table_name:
                 return {
@@ -816,7 +907,15 @@ async def mcp_handler(req: Request):
             }
 
         elif method == "test_connection":
-            database = params.get("database", "primary")
+            database = params.get("database")  # Remove default, make it required
+            
+            if not database:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32602, "message": "database parameter is required. Available databases: " + ", ".join(DATABASE_CONFIGS.keys())}, 
+                    "id": rpc.id
+                }
+            
             connected, message, info = test_database_connection(database)
             
             return {
@@ -832,7 +931,14 @@ async def mcp_handler(req: Request):
 
         elif method == "get_database_info":
             """Get detailed information about a specific database including its actual database name"""
-            database = params.get("database", "primary")
+            database = params.get("database")  # Remove default, make it required
+            
+            if not database:
+                return {
+                    "jsonrpc": "2.0", 
+                    "error": {"code": -32602, "message": "database parameter is required. Available databases: " + ", ".join(DATABASE_CONFIGS.keys())}, 
+                    "id": rpc.id
+                }
             
             try:
                 # Get comprehensive database information
@@ -1013,8 +1119,11 @@ async def mcp_handler(req: Request):
             "id": rpc.id
         }
 
-def run_query(query: str, database: str = "primary"):
+def run_query(query: str, database: str):
     """Execute a query on the specified database"""
+    if not database:
+        raise ValueError("Database parameter is required")
+    
     try:
         with get_sync_connection(database) as conn:
             with conn.cursor() as cur:
@@ -1028,8 +1137,11 @@ def run_query(query: str, database: str = "primary"):
         logger.error(f"Query execution error on {database}: {str(e)}")
         raise
 
-def run_query_with_params(query: str, params: list, database: str = "primary"):
+def run_query_with_params(query: str, params: list, database: str):
     """Execute a parameterized query on the specified database"""
+    if not database:
+        raise ValueError("Database parameter is required")
+        
     try:
         with get_sync_connection(database) as conn:
             with conn.cursor() as cur:
@@ -1043,8 +1155,11 @@ def run_query_with_params(query: str, params: list, database: str = "primary"):
         logger.error(f"Parameterized query execution error on {database}: {str(e)}")
         raise
 
-def run_exec(query: str, database: str = "primary"):
+def run_exec(query: str, database: str):
     """Execute a command on the specified database"""
+    if not database:
+        raise ValueError("Database parameter is required")
+        
     try:
         with get_sync_connection(database) as conn:
             with conn.cursor() as cur:
@@ -1102,7 +1217,7 @@ async def root():
     """Root endpoint with comprehensive server info"""
     return {
         "message": "Enhanced Multi-Database MCP Server",
-        "version": "3.0.1",
+        "version": "3.0.2",
         "configured_databases": list(DATABASE_CONFIGS.keys()),
         "active_pools": len(connection_pools),
         "available_methods": [
@@ -1131,7 +1246,7 @@ if __name__ == "__main__":
     import uvicorn
     
     print("🚀 Starting Enhanced Multi-Database MCP Server...")
-    print(f"📊 Version: 3.0.1")
+    print(f"📊 Version: 3.0.2 - Persistent Connections")
     
     # Print detected database configurations  
     print(f"\n🔍 Scanning .env file for POSTGRES_URL_* and DB_URL_* variables...")
@@ -1139,8 +1254,9 @@ if __name__ == "__main__":
     if not DATABASE_CONFIGS:
         print("⚠️  WARNING: No databases configured!")
         print("\nTo add databases, add variables to your .env file like:")
-        print("POSTGRES_URL_PRIMARY=postgresql://user:password@host:5432/database")
+        print("POSTGRES_URL_SCHOOLSTATUS_CODE=postgresql://user:password@host:5432/database")
         print("DB_URL_SCHOOLSTATUS_CODE=postgresql://user:password@host:5432/schoolstatus_code")
+        print("\n❌ Cannot start server without database configurations!")
     else:
         print(f"✅ Found {len(DATABASE_CONFIGS)} database configurations:")
         
@@ -1151,16 +1267,32 @@ if __name__ == "__main__":
         
         # Test connections on startup
         print("\n🔍 Testing database connections...")
+        healthy_dbs = 0
         for db_name in DATABASE_CONFIGS.keys():
             connected, message, info = test_database_connection(db_name)
             status = "✅" if connected else "❌"
             description = DATABASE_CONFIGS[db_name]["description"]
             print(f"{status} {db_name} ({description}): {message}")
-            if connected and info:
-                print(f"    📈 Response time: {info.get('response_time_ms', 'N/A')}ms")
-                print(f"    🗃️  Tables: {info.get('table_count', 'N/A')}")
-                print(f"    💾 Size: {info.get('database_size_bytes', 0):,} bytes")
-
+            if connected:
+                healthy_dbs += 1
+                if info:
+                    print(f"    📈 Response time: {info.get('response_time_ms', 'N/A')}ms")
+                    print(f"    🗃️  Tables: {info.get('table_count', 'N/A')}")
+                    print(f"    💾 Size: {info.get('database_size_bytes', 0):,} bytes")
+        
+        
+        print(f"\n🎯 Ready to serve {healthy_dbs}/{len(DATABASE_CONFIGS)} databases")
+        print("⚡ All connections will remain persistent and auto-reconnect")
+        print("📋 Database parameter is now REQUIRED for all queries")
+    
+    print(f"\n🔐 Authentication: Disabled")
+    print("🌐 Server starting on http://0.0.0.0:8000")
+    print("📚 API Documentation: http://0.0.0.0:8000/docs")
+    print("🏥 Health Check: http://0.0.0.0:8000/health")
+    print(f"\n💡 Tip: Add more databases by adding POSTGRES_URL_YOURNAME or DB_URL_YOURNAME variables to .env")
+    print("🧪 To test your setup, run: python database_tester.py")
+    print("\n🚨 NOTE: 'database' parameter is now REQUIRED for all queries!")
+    print(f"Available databases: {', '.join(DATABASE_CONFIGS.keys())}")
     
     uvicorn.run(
         app, 
