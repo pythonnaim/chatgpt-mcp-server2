@@ -1599,7 +1599,6 @@ if __name__ == "__main__":
         print("POSTGRES_URL_SCHOOLSTATUS_CODE=postgresql://user:password@host:5432/database")
         print("DB_URL_SCHOOLSTATUS_CODE=postgresql://user:password@host:5432/schoolstatus_code")
         print("\n❌ Cannot start server without database configurations!")
-        return
     else:
         print(f"✅ Found {len(DATABASE_CONFIGS)} database configurations:")
         
